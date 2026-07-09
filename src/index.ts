@@ -1,102 +1,82 @@
-/**
- * LLM Chat Application Template
- *
- * A simple chat application using Cloudflare Workers AI.
- * This template demonstrates how to implement an LLM-powered chat interface with
- * streaming responses using Server-Sent Events (SSE).
- *
- * @license MIT
- */
-import { Env, ChatMessage } from "./types";
+import { Env } from "./types";
 
-// Model ID for Workers AI model
-// https://developers.cloudflare.com/workers-ai/models/
 const MODEL_ID = "@cf/meta/llama-3.1-8b-instruct-fp8";
-
-// Default system prompt
-const SYSTEM_PROMPT =
-	"You are a helpful, friendly assistant. Provide concise and accurate responses.";
+const STT_MODEL = "@cf/openai/whisper";
 
 export default {
-	/**
-	 * Main request handler for the Worker
-	 */
-	async fetch(
-		request: Request,
-		env: Env,
-		ctx: ExecutionContext,
-	): Promise<Response> {
-		const url = new URL(request.url);
+    async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+        const url = new URL(request.url);
 
-		// Handle static assets (frontend)
-		if (url.pathname === "/" || !url.pathname.startsWith("/api/")) {
-			return env.ASSETS.fetch(request);
-		}
+        // ১. টেলিগ্রাম Webhook হ্যান্ডলার
+        if (url.pathname === "/api/telegram-webhook" && request.method === "POST") {
+            return handleTelegramWebhook(request, env);
+        }
 
-		// API Routes
-		if (url.pathname === "/api/chat") {
-			// Handle POST requests for chat
-			if (request.method === "POST") {
-				return handleChatRequest(request, env);
-			}
+        // ২. উইচ্যাট বা রোবট অ্যাকশন হ্যান্ডলার
+        if (url.pathname === "/api/bot-action" && request.method === "POST") {
+            return handleBotAction(request, env);
+        }
 
-			// Method not allowed for other request types
-			return new Response("Method not allowed", { status: 405 });
-		}
-
-		// Handle 404 for unmatched routes
-		return new Response("Not found", { status: 404 });
-	},
+        return new Response("Not found", { status: 404 });
+    },
 } satisfies ExportedHandler<Env>;
 
-/**
- * Handles chat API requests
- */
-async function handleChatRequest(
-	request: Request,
-	env: Env,
-): Promise<Response> {
-	try {
-		// Parse JSON request body
-		const { messages = [] } = (await request.json()) as {
-			messages: ChatMessage[];
-		};
+async function handleTelegramWebhook(request: Request, env: Env): Promise<Response> {
+    const data = await request.json() as any;
+    const message = data.message;
+    if (!message) return new Response("OK");
 
-		// Add system prompt if not present
-		if (!messages.some((msg) => msg.role === "system")) {
-			messages.unshift({ role: "system", content: SYSTEM_PROMPT });
-		}
+    const chatId = message.chat.id;
+    const sender = message.from?.username || "unknown";
+    let textToProcess = "";
 
-		const inputs = {
-			messages,
-			max_tokens: 1024,
-			stream: true,
-		} satisfies AiTextGenerationInput & { stream: true };
+    // ভয়েস মেসেজ প্রসেসিং
+    if (message.voice) {
+        const fileId = message.voice.file_id;
+        const fileRes = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`);
+        const fileData = await fileRes.json() as any;
+        const downloadUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileData.result.file_path}`;
+        
+        const audio = await fetch(downloadUrl).then(res => res.arrayBuffer());
+        const sttResult = await env.AI.run(STT_MODEL, { audio: [...new Uint8Array(audio)] }) as any;
+        textToProcess = sttResult.text;
+    } else {
+        textToProcess = message.text || "";
+    }
 
-		const stream = await env.AI.run<typeof MODEL_ID>(MODEL_ID, inputs, {
-			// Uncomment to use AI Gateway
-			// gateway: {
-			//   id: "YOUR_GATEWAY_ID", // Replace with your AI Gateway ID
-			//   skipCache: false,      // Set to true to bypass cache
-			//   cacheTtl: 3600,        // Cache time-to-live in seconds
-			// },
-		});
+    // AI রেসপন্স জেনারেশন
+    const aiResponse = await getAiResponse(textToProcess, env);
 
-		return new Response(stream, {
-			headers: {
-				"content-type": "text/event-stream; charset=utf-8",
-				"cache-control": "no-cache",
-				connection: "keep-alive",
-			},
-		});
-	} catch (error) {
-		console.error("Error processing chat request:", error);
-		return new Response(
-			JSON.stringify({ error: "Failed to process request" }),
-			{
-				status: 500,
-				headers: { "content-type": "application/json" },
-			},
-		);
-	}
+    // ডাটাবেজে সেভ করা (D1 Database)
+    try {
+        await env.DB.prepare(
+            "INSERT INTO chat_logs (chat_id, sender, input_text, ai_response, created_at) VALUES (?, ?, ?, ?, ?)"
+        )
+        .bind(chatId, sender, textToProcess, aiResponse, new Date().toISOString())
+        .run();
+    } catch (e) {
+        console.error("Database save failed:", e);
+    }
+
+    // টেলিগ্রামে রিপ্লাই পাঠানো
+    await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, text: aiResponse })
+    });
+
+    return new Response("OK");
+}
+
+async function handleBotAction(request: Request, env: Env): Promise<Response> {
+    const { action, secret } = await request.json() as any;
+    if (secret !== env.BOT_SECRET_KEY) return new Response("Unauthorized", { status: 403 });
+    return new Response(JSON.stringify({ status: "Success", action }), { headers: { 'content-type': 'application/json' } });
+}
+
+async function getAiResponse(text: string, env: Env): Promise<string> {
+    const response = await env.AI.run(MODEL_ID, {
+        messages: [{ role: "user", content: text }]
+    }) as any;
+    return response.response;
 }
