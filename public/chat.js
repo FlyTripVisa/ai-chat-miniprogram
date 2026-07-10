@@ -1,6 +1,7 @@
 /**
- * LLM Chat App Frontend - Mobile Black Theme
- * Handles chat UI + Cloudflare Workers AI streaming
+ * LLM Chat App Frontend
+ *
+ * Handles the chat UI interactions and communication with the backend API.
  */
 
 // DOM elements
@@ -17,12 +18,12 @@ let chatHistory = [
 			"Hello! I'm an LLM chat app powered by Cloudflare Workers AI. How can I help you today?",
 	},
 ];
-let isProcessing = true;
+let isProcessing = false;
 
-// Auto-resize textarea as user types - capped at 120px for mobile
+// Auto-resize textarea as user types
 userInput.addEventListener("input", function () {
 	this.style.height = "auto";
-	this.style.height = Math.min(this.scrollHeight, 120) + "px";
+	this.style.height = this.scrollHeight + "px";
 });
 
 // Send message on Enter (without Shift)
@@ -59,7 +60,6 @@ async function sendMessage() {
 
 	// Show typing indicator
 	typingIndicator.classList.add("visible");
-	scrollToBottom();
 
 	// Add message to history
 	chatHistory.push({ role: "user", content: message });
@@ -72,9 +72,10 @@ async function sendMessage() {
 		chatMessages.appendChild(assistantMessageEl);
 		const assistantTextEl = assistantMessageEl.querySelector("p");
 
-		scrollToBottom();
+		// Scroll to bottom
+		chatMessages.scrollTop = chatMessages.scrollHeight;
 
-		// Send request to API - adjust URL if your worker is on different domain
+		// Send request to API
 		const response = await fetch("/api/chat", {
 			method: "POST",
 			headers: {
@@ -87,30 +88,20 @@ async function sendMessage() {
 
 		// Handle errors
 		if (!response.ok) {
-			throw new Error(`HTTP error! status: ${response.status}`);
+			throw new Error("Failed to get response");
 		}
 		if (!response.body) {
 			throw new Error("Response body is null");
 		}
-
-		// Hide typing indicator once stream starts
-		typingIndicator.classList.remove("visible");
 
 		// Process streaming response
 		const reader = response.body.getReader();
 		const decoder = new TextDecoder();
 		let responseText = "";
 		let buffer = "";
-		let lastFlush = 0;
-
 		const flushAssistantText = () => {
-			// Throttle DOM updates for performance on mobile
-			const now = Date.now();
-			if (now - lastFlush > 50) {
-				assistantTextEl.textContent = responseText;
-				scrollToBottom();
-				lastFlush = now;
-			}
+			assistantTextEl.textContent = responseText;
+			chatMessages.scrollTop = chatMessages.scrollHeight;
 		};
 
 		let sawDone = false;
@@ -121,21 +112,24 @@ async function sendMessage() {
 				// Process any remaining complete events in buffer
 				const parsed = consumeSseEvents(buffer + "\n\n");
 				for (const data of parsed.events) {
-					if (data === "[DONE]") break;
+					if (data === "[DONE]") {
+						break;
+					}
 					try {
 						const jsonData = JSON.parse(data);
+						// Handle both Workers AI format (response) and OpenAI format (choices[0].delta.content)
 						let content = "";
-						// Workers AI format
-						if (typeof jsonData.response === "string" && jsonData.response.length > 0) {
+						if (
+							typeof jsonData.response === "string" &&
+							jsonData.response.length > 0
+						) {
 							content = jsonData.response;
-						} 
-						// OpenAI format fallback
-						else if (jsonData.choices?.[0]?.delta?.content) {
+						} else if (jsonData.choices?.[0]?.delta?.content) {
 							content = jsonData.choices[0].delta.content;
 						}
 						if (content) {
 							responseText += content;
-							assistantTextEl.textContent = responseText; // Final flush
+							flushAssistantText();
 						}
 					} catch (e) {
 						console.error("Error parsing SSE data as JSON:", e, data);
@@ -148,7 +142,6 @@ async function sendMessage() {
 			buffer += decoder.decode(value, { stream: true });
 			const parsed = consumeSseEvents(buffer);
 			buffer = parsed.buffer;
-			
 			for (const data of parsed.events) {
 				if (data === "[DONE]") {
 					sawDone = true;
@@ -157,8 +150,12 @@ async function sendMessage() {
 				}
 				try {
 					const jsonData = JSON.parse(data);
+					// Handle both Workers AI format (response) and OpenAI format (choices[0].delta.content)
 					let content = "";
-					if (typeof jsonData.response === "string" && jsonData.response.length > 0) {
+					if (
+						typeof jsonData.response === "string" &&
+						jsonData.response.length > 0
+					) {
 						content = jsonData.response;
 					} else if (jsonData.choices?.[0]?.delta?.content) {
 						content = jsonData.choices[0].delta.content;
@@ -171,12 +168,10 @@ async function sendMessage() {
 					console.error("Error parsing SSE data as JSON:", e, data);
 				}
 			}
-			if (sawDone) break;
+			if (sawDone) {
+				break;
+			}
 		}
-
-		// Final update
-		assistantTextEl.textContent = responseText;
-		scrollToBottom();
 
 		// Add completed response to chat history
 		if (responseText.length > 0) {
@@ -186,7 +181,7 @@ async function sendMessage() {
 		console.error("Error:", error);
 		addMessageToChat(
 			"assistant",
-			"Sorry, there was an error processing your request. Please try again.",
+			"Sorry, there was an error processing your request.",
 		);
 	} finally {
 		// Hide typing indicator
@@ -206,19 +201,11 @@ async function sendMessage() {
 function addMessageToChat(role, content) {
 	const messageEl = document.createElement("div");
 	messageEl.className = `message ${role}-message`;
-	messageEl.innerHTML = `<p></p>`;
-	messageEl.querySelector("p").textContent = content; // Use textContent to prevent XSS
+	messageEl.innerHTML = `<p>${content}</p>`;
 	chatMessages.appendChild(messageEl);
-	scrollToBottom();
-}
 
-/**
- * Smooth scroll to bottom - better for mobile
- */
-function scrollToBottom() {
-	requestAnimationFrame(() => {
-		chatMessages.scrollTop = chatMessages.scrollHeight;
-	});
+	// Scroll to bottom
+	chatMessages.scrollTop = chatMessages.scrollHeight;
 }
 
 function consumeSseEvents(buffer) {
@@ -240,9 +227,4 @@ function consumeSseEvents(buffer) {
 		events.push(dataLines.join("\n"));
 	}
 	return { events, buffer: normalized };
-}
-
-// Focus input on load for desktop, not mobile to avoid keyboard popup
-if (!/Mobi|Android/i.test(navigator.userAgent)) {
-	userInput.focus();
 }
